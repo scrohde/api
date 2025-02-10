@@ -1,0 +1,24 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.out
+
+# Build directories and artifacts
+/build/
+*.test
+
+# Dependency directories (if not vendored)
+vendor/
+
+# Editor and IDE directories
+.idea/
+.vscode/
+*.swp
+*~
+
+# Operating system files
+.DS_Store
+Thumbs.db
