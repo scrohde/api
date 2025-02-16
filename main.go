@@ -18,9 +18,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config holds the saved configuration values.
+// Config holds the saved configuration values for a specific host.
 type Config struct {
-	Host     string            `yaml:"host"`
+	BaseURL  string            `yaml:"base"`
 	Method   string            `yaml:"method"`
 	Username string            `yaml:"username"`
 	Password string            `yaml:"password"`
@@ -32,7 +32,30 @@ type Config struct {
 	Headers  map[string]string `yaml:"headers"`
 }
 
-// headerFlag is a custom flag type to allow repeatable -H options.
+// SavedConfigs holds the mapping from normalized host to its configuration and the last used host.
+type SavedConfigs struct {
+	LastUsed string            `yaml:"last_used"`
+	Configs  map[string]Config `yaml:"configs"`
+}
+
+// Options holds the command-line options.
+type Options struct {
+	BaseURL   string
+	Method    string
+	Username  string
+	Password  string
+	Token     string
+	CACert    string
+	Cert      string
+	Key       string
+	Body      string
+	Headers   map[string]string
+	Save      bool
+	URLPath   string
+	ReadStdin bool
+}
+
+// headerFlag allows repeatable -H options.
 type headerFlag struct {
 	headers map[string]string
 }
@@ -59,6 +82,16 @@ func (h *headerFlag) Set(value string) error {
 	return nil
 }
 
+// fatal prints an error message and exits.
+func fatal(msg string, err error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", msg, err)
+	} else {
+		fmt.Fprintln(os.Stderr, msg)
+	}
+	os.Exit(1)
+}
+
 // getConfigPath returns the file path for the configuration file.
 func getConfigPath() (string, error) {
 	home, err := os.UserHomeDir()
@@ -68,31 +101,35 @@ func getConfigPath() (string, error) {
 	return filepath.Join(home, ".api_config.yaml"), nil
 }
 
-// loadConfig loads the YAML configuration from the config file (if it exists).
-func loadConfig() (*Config, error) {
-	cfg := &Config{}
+// loadConfigs loads the YAML configuration from the config file.
+func loadConfigs() (SavedConfigs, error) {
+	sc := SavedConfigs{}
 	configPath, err := getConfigPath()
 	if err != nil {
-		return nil, err
+		return sc, err
 	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		// It's acceptable if the config file doesn't exist.
-		return cfg, nil
+		sc.Configs = make(map[string]Config)
+		return sc, nil
 	}
-	if err := yaml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("error parsing config file: %w", err)
+	if err := yaml.Unmarshal(data, &sc); err != nil {
+		return sc, fmt.Errorf("error parsing config file: %w", err)
 	}
-	return cfg, nil
+	if sc.Configs == nil {
+		sc.Configs = make(map[string]Config)
+	}
+	return sc, nil
 }
 
-// saveConfig saves the configuration to the YAML config file.
-func saveConfig(cfg *Config) error {
+// saveConfigs saves the configurations to the YAML config file.
+func saveConfigs(sc SavedConfigs) error {
 	configPath, err := getConfigPath()
 	if err != nil {
 		return err
 	}
-	data, err := yaml.Marshal(cfg)
+	data, err := yaml.Marshal(sc)
 	if err != nil {
 		return err
 	}
@@ -127,11 +164,11 @@ func setupTLSConfig(certFile, keyFile, caCertFile string) (*tls.Config, error) {
 
 // buildHTTPClient creates an HTTP client, configuring mTLS if needed.
 func buildHTTPClient(cert, key, cacert string) (*http.Client, error) {
-	client := &http.Client{}
 	tlsConfig, err := setupTLSConfig(cert, key, cacert)
 	if err != nil {
 		return nil, err
 	}
+	client := &http.Client{}
 	if tlsConfig != nil {
 		client.Transport = &http.Transport{
 			TLSClientConfig: tlsConfig,
@@ -140,30 +177,23 @@ func buildHTTPClient(cert, key, cacert string) (*http.Client, error) {
 	return client, nil
 }
 
-// buildFinalURL constructs the final URL from a host and URL path.
-func buildFinalURL(host, urlPath string) (string, error) {
-	if strings.HasPrefix(urlPath, "http://") || strings.HasPrefix(urlPath, "https://") {
-		return urlPath, nil
+// buildURL constructs the URL from a base and relative path.
+func buildURL(base, rel string) (*url.URL, error) {
+	if !strings.Contains(base, "://") {
+		base = "https://" + base
 	}
-	if host == "" {
-		return "", fmt.Errorf("no host specified and URL path is not a full URL")
-	}
-	// Assume HTTPS if no scheme is provided.
-	if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
-		host = "https://" + host
-	}
-	baseURL, err := url.Parse(host)
+	baseURL, err := url.Parse(base)
 	if err != nil {
-		return "", fmt.Errorf("parsing host URL: %w", err)
+		return nil, fmt.Errorf("parsing base URL: %w", err)
 	}
-	relURL, err := url.Parse(urlPath)
+	finalURL, err := baseURL.Parse(rel)
 	if err != nil {
-		return "", fmt.Errorf("parsing URL path: %w", err)
+		return nil, fmt.Errorf("invalid URL path arg: %w", err)
 	}
-	return baseURL.ResolveReference(relURL).String(), nil
+	return finalURL, nil
 }
 
-// readRequestBody determines the request body based on flag input or stdin.
+// readRequestBody reads the request body from the flag value or stdin.
 func readRequestBody(flagBody string, readStdin bool) ([]byte, error) {
 	if readStdin {
 		return io.ReadAll(os.Stdin)
@@ -174,27 +204,31 @@ func readRequestBody(flagBody string, readStdin bool) ([]byte, error) {
 // addJSONContentType adds a JSON Content-Type header if the body appears to be JSON.
 func addJSONContentType(headers map[string]string, body []byte) {
 	trimmed := strings.TrimSpace(string(body))
-	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
-		for k := range headers {
-			if strings.ToLower(k) == "content-type" {
-				return
-			}
-		}
+	if (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) && !hasContentType(headers) {
 		headers["Content-Type"] = "application/json"
 	}
 }
 
-// processResponse handles outputting the HTTP response.
+func hasContentType(headers map[string]string) bool {
+	for k := range headers {
+		if strings.ToLower(k) == "content-type" {
+			return true
+		}
+	}
+	return false
+}
+
+// processResponse outputs the HTTP response.
 func processResponse(resp *http.Response) error {
 	defer resp.Body.Close()
+
+	fmt.Fprintln(os.Stderr, resp.Request.Method, resp.Request.URL)
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("reading response: %w", err)
 	}
 	contentType := resp.Header.Get("Content-Type")
-	isJSON := strings.Contains(strings.ToLower(contentType), "application/json")
-	if isJSON {
-		// Print the HTTP status code to stderr and pretty-print JSON to stdout.
+	if strings.Contains(strings.ToLower(contentType), "application/json") {
 		fmt.Fprintln(os.Stderr, resp.Status)
 		var pretty bytes.Buffer
 		if err := json.Indent(&pretty, body, "", "  "); err != nil {
@@ -209,38 +243,21 @@ func processResponse(resp *http.Response) error {
 	return nil
 }
 
-func main() {
-	// Load saved configuration.
-	cfg, err := loadConfig()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not load config: %v\n", err)
-		cfg = &Config{}
-	}
-	// Set default HTTP method if not provided.
-	if cfg.Method == "" {
-		cfg.Method = "GET"
-	}
-
-	// Prepare flags using configuration values as defaults.
-	hostFlag := flag.String("host", cfg.Host, "Base URL or hostname (if scheme is omitted, https:// is assumed)")
-	methodFlag := flag.String("x", cfg.Method, "HTTP method to use")
-	flag.StringVar(methodFlag, "method", *methodFlag, "HTTP method to use")
-	usernameFlag := flag.String("username", cfg.Username, "Basic auth username")
-	passwordFlag := flag.String("password", cfg.Password, "Basic auth password")
-	tokenFlag := flag.String("token", cfg.Token, "Bearer token for Authorization header")
-	cacertFlag := flag.String("cacert", cfg.CACert, "CA certificate file for mTLS")
-	certFlag := flag.String("cert", cfg.Cert, "Client certificate file for mTLS")
-	keyFlag := flag.String("key", cfg.Key, "Client key file for mTLS")
-	bodyFlag := flag.String("body", cfg.Body, "Request body (if it starts with { or [, Content-Type is set to application/json)")
-	saveFlag := flag.Bool("save", false, "Save all flag values to the config file for reuse")
-
-	// Set up header flags.
+// parseFlags parses command-line flags and returns an Options struct.
+func parseFlags() Options {
 	var hdrs = headerFlag{headers: make(map[string]string)}
-	if cfg.Headers != nil {
-		for k, v := range cfg.Headers {
-			hdrs.headers[k] = v
-		}
-	}
+
+	host := flag.String("host", "", "Base URL or hostname")
+	method := flag.String("x", "", "HTTP method to use")
+	username := flag.String("username", "", "Basic auth username")
+	password := flag.String("password", "", "Basic auth password")
+	token := flag.String("token", "", "Bearer token for Authorization header")
+	cacert := flag.String("cacert", "", "CA certificate file for mTLS")
+	cert := flag.String("cert", "", "Client certificate file for mTLS")
+	key := flag.String("key", "", "Client key file for mTLS")
+	body := flag.String("d", "", "Request body data (if it starts with { or [, Content-Type is set to application/json)")
+	save := flag.Bool("save", false, "Save all flag values to the config file for reuse")
+
 	flag.Var(&hdrs, "H", "Custom header in the form \"Key: Value\" (can be repeated)")
 
 	flag.Usage = func() {
@@ -249,7 +266,6 @@ func main() {
 	}
 	flag.Parse()
 
-	// Ensure the URL path argument is provided.
 	args := flag.Args()
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "Error: missing URL path argument")
@@ -258,7 +274,7 @@ func main() {
 	}
 	urlPath := args[0]
 
-	// Check for the "--" argument to signal reading body from stdin.
+	// Check for "--" argument to signal reading body from stdin.
 	readStdin := false
 	for _, arg := range args[1:] {
 		if arg == "--" {
@@ -267,74 +283,154 @@ func main() {
 		}
 	}
 
-	// Read and prepare the request body.
-	reqBody, err := readRequestBody(*bodyFlag, readStdin)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading request body: %v\n", err)
-		os.Exit(1)
+	return Options{
+		BaseURL:   *host,
+		Method:    *method,
+		Username:  *username,
+		Password:  *password,
+		Token:     *token,
+		CACert:    *cacert,
+		Cert:      *cert,
+		Key:       *key,
+		Body:      *body,
+		Headers:   hdrs.headers,
+		Save:      *save,
+		URLPath:   urlPath,
+		ReadStdin: readStdin,
 	}
-	addJSONContentType(hdrs.headers, reqBody)
+}
 
-	// Build the final URL.
-	finalURL, err := buildFinalURL(*hostFlag, urlPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error building final URL: %v\n", err)
-		os.Exit(1)
+// extractHost determines the host from the provided options or last used host.
+func extractHost(baseURL, urlPath, lastUsed string) string {
+	// Try to extract from baseURL.
+	if baseURL != "" {
+		if u, err := url.Parse(baseURL); err == nil && u.Host != "" {
+			return u.Host
+		}
 	}
+	// Try to extract from urlPath.
+	if u, err := url.Parse(urlPath); err == nil && u.Host != "" {
+		return u.Host
+	}
+	// Fall back to last used.
+	return lastUsed
+}
 
-	// Create the HTTP request.
-	req, err := http.NewRequest(strings.ToUpper(*methodFlag), finalURL, bytes.NewReader(reqBody))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating HTTP request: %v\n", err)
-		os.Exit(1)
+// mergeConfig applies non-empty fields from the saved config to opts.
+func mergeConfig(opts *Options, cfg Config) {
+	if opts.BaseURL == "" {
+		opts.BaseURL = cfg.BaseURL
 	}
-	// Set any custom headers.
-	for k, v := range hdrs.headers {
+	if opts.Method == "" {
+		opts.Method = cfg.Method
+	}
+	if opts.Username == "" {
+		opts.Username = cfg.Username
+	}
+	if opts.Password == "" {
+		opts.Password = cfg.Password
+	}
+	if opts.Token == "" {
+		opts.Token = cfg.Token
+	}
+	if opts.CACert == "" {
+		opts.CACert = cfg.CACert
+	}
+	if opts.Cert == "" {
+		opts.Cert = cfg.Cert
+	}
+	if opts.Key == "" {
+		opts.Key = cfg.Key
+	}
+	if opts.Body == "" {
+		opts.Body = cfg.Body
+	}
+	if len(opts.Headers) == 0 && cfg.Headers != nil {
+		opts.Headers = cfg.Headers
+	}
+}
+
+func createRequest(opts Options, finalURL string, reqBody []byte) *http.Request {
+	req, err := http.NewRequest(strings.ToUpper(opts.Method), finalURL, bytes.NewReader(reqBody))
+	if err != nil {
+		fatal("Error creating HTTP request", err)
+	}
+	for k, v := range opts.Headers {
 		req.Header.Set(k, v)
 	}
-	// Set authentication headers.
-	if *tokenFlag != "" {
-		req.Header.Set("Authorization", "Bearer "+*tokenFlag)
-	} else if *usernameFlag != "" && *passwordFlag != "" {
-		req.SetBasicAuth(*usernameFlag, *passwordFlag)
+	if opts.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+opts.Token)
+	} else if opts.Username != "" && opts.Password != "" {
+		req.SetBasicAuth(opts.Username, opts.Password)
 	}
+	return req
+}
 
-	// Build the HTTP client (with mTLS if parameters are provided).
-	client, err := buildHTTPClient(*certFlag, *keyFlag, *cacertFlag)
+func main() {
+	// 1. Parse command-line flags.
+	opts := parseFlags()
+
+	// 2. Load saved configurations.
+	savedConfigs, err := loadConfigs()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error setting up HTTP client: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "Warning: could not load config: %v\n", err)
+		savedConfigs = SavedConfigs{Configs: make(map[string]Config)}
 	}
 
-	// Execute the HTTP request.
+	// 3. Determine the effective host and merge saved config if available.
+	host := extractHost(opts.BaseURL, opts.URLPath, savedConfigs.LastUsed)
+	if cfg, exists := savedConfigs.Configs[host]; exists {
+		mergeConfig(&opts, cfg)
+	}
+	// Set default HTTP method if still not provided.
+	if opts.Method == "" {
+		opts.Method = "GET"
+	}
+
+	// 4. Build the final URL.
+	finalURL, err := buildURL(opts.BaseURL, opts.URLPath)
+	if err != nil {
+		fatal("Error building final URL", err)
+	}
+
+	// 5. Read and prepare the request body.
+	reqBody, err := readRequestBody(opts.Body, opts.ReadStdin)
+	if err != nil {
+		fatal("Error reading request body", err)
+	}
+	addJSONContentType(opts.Headers, reqBody)
+
+	// 6. Create and send the HTTP request.
+	req := createRequest(opts, finalURL.String(), reqBody)
+	client, err := buildHTTPClient(opts.Cert, opts.Key, opts.CACert)
+	if err != nil {
+		fatal("Error setting up HTTP client", err)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error making HTTP request: %v\n", err)
-		os.Exit(1)
+		fatal("Error making HTTP request", err)
 	}
-
 	if err := processResponse(resp); err != nil {
-		fmt.Fprintf(os.Stderr, "Error processing response: %v\n", err)
-		os.Exit(1)
+		fatal("Error processing response", err)
 	}
 
-	// Optionally, save the effective configuration.
-	if *saveFlag {
-		newCfg := &Config{
-			Host:     *hostFlag,
-			Method:   strings.ToUpper(*methodFlag),
-			Username: *usernameFlag,
-			Password: *passwordFlag,
-			Token:    *tokenFlag,
-			CACert:   *cacertFlag,
-			Cert:     *certFlag,
-			Key:      *keyFlag,
-			Body:     *bodyFlag, // Note: if the body came from stdin, this flag value is still saved.
-			Headers:  hdrs.headers,
+	// 7. Optionally, save the effective configuration.
+	if opts.Save {
+		savedConfigs.Configs[finalURL.Host] = Config{
+			BaseURL:  opts.BaseURL,
+			Method:   strings.ToUpper(opts.Method),
+			Username: opts.Username,
+			Password: opts.Password,
+			Token:    opts.Token,
+			CACert:   opts.CACert,
+			Cert:     opts.Cert,
+			Key:      opts.Key,
+			Body:     opts.Body,
+			Headers:  opts.Headers,
 		}
-		if err := saveConfig(newCfg); err != nil {
+		savedConfigs.LastUsed = finalURL.Host
+		if err := saveConfigs(savedConfigs); err != nil {
 			fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
-			// Continue even if saving the config fails.
 		}
 	}
 }
