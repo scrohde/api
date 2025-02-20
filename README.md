@@ -33,7 +33,7 @@ Usage: api [flags] <url-path> [--]
 - `-host`  
   The base URL or hostname (if scheme is omitted, `https://` is assumed).
 
-- `-x` or `-method`  
+- `-x`
   HTTP method to use (e.g. GET, POST, PUT, PATCH, DELETE).
 
 - `-username` and `-password`  
@@ -51,7 +51,7 @@ Usage: api [flags] <url-path> [--]
 - `-key`  
   Client key file for mTLS.
 
-- `-body`  
+- `-d`  
   Request body. If it starts with `{` or `[`, the tool automatically sets `Content-Type` to `application/json`.
 
 - `-H`  
