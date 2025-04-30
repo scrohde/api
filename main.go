@@ -1,4 +1,3 @@
-// main.go
 package main
 
 import (
@@ -6,7 +5,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,422 +13,311 @@ import (
 	"path/filepath"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
-// Config holds the saved configuration values for a specific host.
-type Config struct {
-	BaseURL  string            `yaml:"base"`
-	Method   string            `yaml:"method"`
-	Username string            `yaml:"username"`
-	Password string            `yaml:"password"`
-	Token    string            `yaml:"token"`
-	CACert   string            `yaml:"cacert"`
-	Cert     string            `yaml:"cert"`
-	Key      string            `yaml:"key"`
-	Body     string            `yaml:"body"`
-	Headers  map[string]string `yaml:"headers"`
-}
-
-// SavedConfigs holds the mapping from normalized host to its configuration and the last used host.
-type SavedConfigs struct {
-	LastUsed string            `yaml:"last_used"`
-	Configs  map[string]Config `yaml:"configs"`
-}
-
-// Options holds the command-line options.
-type Options struct {
-	BaseURL   string
-	Method    string
-	Username  string
-	Password  string
-	Token     string
-	CACert    string
-	Cert      string
-	Key       string
-	Body      string
-	Headers   map[string]string
-	Save      bool
-	URLPath   string
-	ReadStdin bool
-}
-
-// headerFlag allows repeatable -H options.
-type headerFlag struct {
-	headers map[string]string
-}
-
-func (h *headerFlag) String() string {
-	var parts []string
-	for k, v := range h.headers {
-		parts = append(parts, fmt.Sprintf("%s: %s", k, v))
-	}
-	return strings.Join(parts, ", ")
-}
-
-func (h *headerFlag) Set(value string) error {
-	parts := strings.SplitN(value, ":", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid header format (expected key:value): %s", value)
-	}
-	key := strings.TrimSpace(parts[0])
-	val := strings.TrimSpace(parts[1])
-	if h.headers == nil {
-		h.headers = make(map[string]string)
-	}
-	h.headers[key] = val
-	return nil
-}
-
-// fatal prints an error message and exits.
-func fatal(msg string, err error) {
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", msg, err)
-	} else {
-		fmt.Fprintln(os.Stderr, msg)
-	}
-	os.Exit(1)
-}
-
-// getConfigPath returns the file path for the configuration file.
-func getConfigPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".api_config.yaml"), nil
-}
-
-// loadConfigs loads the YAML configuration from the config file.
-func loadConfigs() (SavedConfigs, error) {
-	sc := SavedConfigs{}
-	configPath, err := getConfigPath()
-	if err != nil {
-		return sc, err
-	}
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		// It's acceptable if the config file doesn't exist.
-		sc.Configs = make(map[string]Config)
-		return sc, nil
-	}
-	if err := yaml.Unmarshal(data, &sc); err != nil {
-		return sc, fmt.Errorf("error parsing config file: %w", err)
-	}
-	if sc.Configs == nil {
-		sc.Configs = make(map[string]Config)
-	}
-	return sc, nil
-}
-
-// saveConfigs saves the configurations to the YAML config file.
-func saveConfigs(sc SavedConfigs) error {
-	configPath, err := getConfigPath()
-	if err != nil {
-		return err
-	}
-	data, err := yaml.Marshal(sc)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(configPath, data, 0600)
-}
-
-// setupTLSConfig returns a TLS configuration if mTLS parameters are provided.
-func setupTLSConfig(certFile, keyFile, caCertFile string) (*tls.Config, error) {
-	if certFile == "" || keyFile == "" {
-		return nil, nil
-	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("loading client certificate/key: %w", err)
-	}
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-	}
-	if caCertFile != "" {
-		caCert, err := os.ReadFile(caCertFile)
-		if err != nil {
-			return nil, fmt.Errorf("reading CA certificate: %w", err)
-		}
-		caPool := x509.NewCertPool()
-		if !caPool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("appending CA certificate")
-		}
-		tlsConfig.RootCAs = caPool
-	}
-	return tlsConfig, nil
-}
-
-// buildHTTPClient creates an HTTP client, configuring mTLS if needed.
-func buildHTTPClient(cert, key, cacert string) (*http.Client, error) {
-	tlsConfig, err := setupTLSConfig(cert, key, cacert)
-	if err != nil {
-		return nil, err
-	}
-	client := &http.Client{}
-	if tlsConfig != nil {
-		client.Transport = &http.Transport{
-			TLSClientConfig: tlsConfig,
-		}
-	}
-	return client, nil
-}
-
-// buildURL constructs the URL from a base and relative path.
-func buildURL(base, rel string) (*url.URL, error) {
-	if !strings.Contains(base, "://") {
-		base = "https://" + base
-	}
-	baseURL, err := url.Parse(base)
-	if err != nil {
-		return nil, fmt.Errorf("parsing base URL: %w", err)
-	}
-	finalURL, err := baseURL.Parse(rel)
-	if err != nil {
-		return nil, fmt.Errorf("invalid URL path arg: %w", err)
-	}
-	return finalURL, nil
-}
-
-// readRequestBody reads the request body from the flag value or stdin.
-func readRequestBody(flagBody string, readStdin bool) ([]byte, error) {
-	if readStdin {
-		return io.ReadAll(os.Stdin)
-	}
-	return []byte(flagBody), nil
-}
-
-// addJSONContentType adds a JSON Content-Type header if the body appears to be JSON.
-func addJSONContentType(headers map[string]string, body []byte) {
-	trimmed := strings.TrimSpace(string(body))
-	if (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) && !hasContentType(headers) {
-		headers["Content-Type"] = "application/json"
-	}
-}
-
-func hasContentType(headers map[string]string) bool {
-	for k := range headers {
-		if strings.ToLower(k) == "content-type" {
-			return true
-		}
-	}
-	return false
-}
-
-// processResponse outputs the HTTP response.
-func processResponse(resp *http.Response) error {
-	defer resp.Body.Close()
-
-	fmt.Fprintln(os.Stderr, resp.Request.Method, resp.Request.URL)
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("reading response: %w", err)
-	}
-	contentType := resp.Header.Get("Content-Type")
-	if strings.Contains(strings.ToLower(contentType), "application/json") {
-		fmt.Fprintln(os.Stderr, resp.Status)
-		var pretty bytes.Buffer
-		if err := json.Indent(&pretty, body, "", "  "); err != nil {
-			_, _ = os.Stdout.Write(body)
-		} else {
-			_, _ = os.Stdout.Write(pretty.Bytes())
-		}
-	} else {
-		fmt.Println(resp.Status)
-		_, _ = os.Stdout.Write(body)
-	}
-	return nil
-}
-
-// parseFlags parses command-line flags and returns an Options struct.
-func parseFlags() Options {
-	var hdrs = headerFlag{headers: make(map[string]string)}
-
-	host := flag.String("host", "", "Base URL or hostname")
-	method := flag.String("x", "", "HTTP method to use")
-	username := flag.String("username", "", "Basic auth username")
-	password := flag.String("password", "", "Basic auth password")
-	token := flag.String("token", "", "Bearer token for Authorization header")
-	cacert := flag.String("cacert", "", "CA certificate file for mTLS")
-	cert := flag.String("cert", "", "Client certificate file for mTLS")
-	key := flag.String("key", "", "Client key file for mTLS")
-	body := flag.String("d", "", "Request body data (if it starts with { or [, Content-Type is set to application/json)")
-	save := flag.Bool("save", false, "Save all flag values to the config file for reuse")
-
-	flag.Var(&hdrs, "H", "Custom header in the form \"Key: Value\" (can be repeated)")
-
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [flags] <url-path> [--]\n", os.Args[0])
-		flag.PrintDefaults()
-	}
-	flag.Parse()
-
-	args := flag.Args()
-	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Error: missing URL path argument")
-		flag.Usage()
-		os.Exit(1)
-	}
-	urlPath := args[0]
-
-	// Check for "--" argument to signal reading body from stdin.
-	readStdin := false
-	for _, arg := range args[1:] {
-		if arg == "--" {
-			readStdin = true
-			break
-		}
-	}
-
-	return Options{
-		BaseURL:   *host,
-		Method:    *method,
-		Username:  *username,
-		Password:  *password,
-		Token:     *token,
-		CACert:    *cacert,
-		Cert:      *cert,
-		Key:       *key,
-		Body:      *body,
-		Headers:   hdrs.headers,
-		Save:      *save,
-		URLPath:   urlPath,
-		ReadStdin: readStdin,
-	}
-}
-
-// extractHost determines the host from the provided options or last used host.
-func extractHost(baseURL, urlPath, lastUsed string) string {
-	// Try to extract from baseURL.
-	if baseURL != "" {
-		if u, err := url.Parse(baseURL); err == nil && u.Host != "" {
-			return u.Host
-		}
-	}
-	// Try to extract from urlPath.
-	if u, err := url.Parse(urlPath); err == nil && u.Host != "" {
-		return u.Host
-	}
-	// Fall back to last used.
-	return lastUsed
-}
-
-// mergeConfig applies non-empty fields from the saved config to opts.
-func mergeConfig(opts *Options, cfg Config) {
-	if opts.BaseURL == "" {
-		opts.BaseURL = cfg.BaseURL
-	}
-	if opts.Method == "" {
-		opts.Method = cfg.Method
-	}
-	if opts.Username == "" {
-		opts.Username = cfg.Username
-	}
-	if opts.Password == "" {
-		opts.Password = cfg.Password
-	}
-	if opts.Token == "" {
-		opts.Token = cfg.Token
-	}
-	if opts.CACert == "" {
-		opts.CACert = cfg.CACert
-	}
-	if opts.Cert == "" {
-		opts.Cert = cfg.Cert
-	}
-	if opts.Key == "" {
-		opts.Key = cfg.Key
-	}
-	if opts.Body == "" {
-		opts.Body = cfg.Body
-	}
-	if len(opts.Headers) == 0 && cfg.Headers != nil {
-		opts.Headers = cfg.Headers
-	}
-}
-
-func createRequest(opts Options, finalURL string, reqBody []byte) *http.Request {
-	req, err := http.NewRequest(strings.ToUpper(opts.Method), finalURL, bytes.NewReader(reqBody))
-	if err != nil {
-		fatal("Error creating HTTP request", err)
-	}
-	for k, v := range opts.Headers {
-		req.Header.Set(k, v)
-	}
-	if opts.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+opts.Token)
-	} else if opts.Username != "" && opts.Password != "" {
-		req.SetBasicAuth(opts.Username, opts.Password)
-	}
-	return req
-}
+var cfgFile string
 
 func main() {
-	// 1. Parse command-line flags.
-	opts := parseFlags()
+	cobra.OnInitialize(initConfig)
+	rootCmd := &cobra.Command{
+		Use:   "api [method] [path]",
+		Short: "api - simple REST client with JSON formatting and config profiles",
+		Args:  cobra.MinimumNArgs(1),
+		RunE:  runRequest,
+	}
 
-	// 2. Load saved configurations.
-	savedConfigs, err := loadConfigs()
+	// Global flags
+	rootCmd.PersistentFlags().StringP("profile", "p", "", "Profile name to use from config")
+	rootCmd.PersistentFlags().StringP("data", "d", "", "Request body or '@file' to read from file or '-' for stdin")
+	rootCmd.PersistentFlags().StringArray("header", []string{}, "Add request header (Key: Value)")
+	rootCmd.PersistentFlags().String("cert", "", "Client certificate file for mTLS")
+	rootCmd.PersistentFlags().String("key", "", "Client key file for mTLS")
+	rootCmd.PersistentFlags().String("ca", "", "Custom CA cert file")
+	rootCmd.PersistentFlags().Bool("save", false, "Save flags as default for this profile")
+	// Auth shortcuts
+	rootCmd.PersistentFlags().String("token", "", "Bearer token for Authorization header")
+	rootCmd.PersistentFlags().String("user", "", "Username for basic auth")
+	rootCmd.PersistentFlags().String("password", "", "Password for basic auth")
+
+	// Config subcommands
+	config := &cobra.Command{
+		Use:   "config",
+		Short: "Manage profiles",
+	}
+	add := &cobra.Command{
+		Use:   "add [profile] [baseURL]",
+		Short: "Add or update a profile",
+		Args:  cobra.ExactArgs(2),
+		RunE:  addProfile,
+	}
+	list := &cobra.Command{
+		Use:   "list",
+		Short: "List all profiles",
+		Args:  cobra.NoArgs,
+		Run:   listProfiles,
+	}
+	use := &cobra.Command{
+		Use:   "use [profile]",
+		Short: "Set default profile",
+		Args:  cobra.ExactArgs(1),
+		RunE:  useProfile,
+	}
+
+	config.AddCommand(add, list, use)
+	rootCmd.AddCommand(config)
+
+	rootCmd.Execute()
+}
+
+func initConfig() {
+	home, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not load config: %v\n", err)
-		savedConfigs = SavedConfigs{Configs: make(map[string]Config)}
+		fmt.Fprintln(os.Stderr, "Error finding home directory:", err)
+		os.Exit(1)
+	}
+	configDir := filepath.Join(home, ".config", "api")
+	os.MkdirAll(configDir, 0700)
+	cfgFile = filepath.Join(configDir, "config.yaml")
+
+	viper.SetConfigFile(cfgFile)
+	viper.SetConfigType("yaml")
+	_ = viper.ReadInConfig()
+}
+
+// Profile structure
+
+type Profile struct {
+	BaseURL  string            `yaml:"base_url" mapstructure:"base_url"`
+	Headers  map[string]string `mapstructure:"headers"`
+	Cert     string            `mapstructure:"cert"`
+	Key      string            `mapstructure:"key"`
+	CA       string            `mapstructure:"ca"`
+	Token    string            `mapstructure:"token"`
+	Username string            `mapstructure:"username"`
+	Password string            `mapstructure:"password"`
+}
+
+func addProfile(cmd *cobra.Command, args []string) error {
+	name := args[0]
+	base := args[1]
+
+	// Validate baseURL
+	parsedBaseURL, err := url.Parse(base)
+	if err != nil || !parsedBaseURL.IsAbs() || parsedBaseURL.Hostname() == "" {
+		return fmt.Errorf("invalid baseURL: must be a valid absolute URL with hostname")
 	}
 
-	// 3. Determine the effective host and merge saved config if available.
-	host := extractHost(opts.BaseURL, opts.URLPath, savedConfigs.LastUsed)
-	if cfg, exists := savedConfigs.Configs[host]; exists {
-		mergeConfig(&opts, cfg)
-	}
-	// Set default HTTP method if still not provided.
-	if opts.Method == "" {
-		opts.Method = "GET"
-	}
-
-	// 4. Build the final URL.
-	finalURL, err := buildURL(opts.BaseURL, opts.URLPath)
-	if err != nil {
-		fatal("Error building final URL", err)
-	}
-
-	// 5. Read and prepare the request body.
-	reqBody, err := readRequestBody(opts.Body, opts.ReadStdin)
-	if err != nil {
-		fatal("Error reading request body", err)
-	}
-	addJSONContentType(opts.Headers, reqBody)
-
-	// 6. Create and send the HTTP request.
-	req := createRequest(opts, finalURL.String(), reqBody)
-	client, err := buildHTTPClient(opts.Cert, opts.Key, opts.CACert)
-	if err != nil {
-		fatal("Error setting up HTTP client", err)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		fatal("Error making HTTP request", err)
-	}
-	if err := processResponse(resp); err != nil {
-		fatal("Error processing response", err)
-	}
-
-	// 7. Optionally, save the effective configuration.
-	if opts.Save {
-		savedConfigs.Configs[finalURL.Host] = Config{
-			BaseURL:  opts.BaseURL,
-			Method:   strings.ToUpper(opts.Method),
-			Username: opts.Username,
-			Password: opts.Password,
-			Token:    opts.Token,
-			CACert:   opts.CACert,
-			Cert:     opts.Cert,
-			Key:      opts.Key,
-			Body:     opts.Body,
-			Headers:  opts.Headers,
+	p := Profile{BaseURL: base, Headers: map[string]string{}}
+	// headers
+	headers, _ := cmd.Flags().GetStringArray("header")
+	for _, h := range headers {
+		parts := strings.SplitN(h, ":", 2)
+		if len(parts) == 2 {
+			p.Headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 		}
-		savedConfigs.LastUsed = finalURL.Host
-		if err := saveConfigs(savedConfigs); err != nil {
-			fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+	}
+	// mTLS
+	p.Cert, _ = cmd.Flags().GetString("cert")
+	p.Key, _ = cmd.Flags().GetString("key")
+	p.CA, _ = cmd.Flags().GetString("ca")
+	// auth shortcuts
+	p.Token, _ = cmd.Flags().GetString("token")
+	p.Username, _ = cmd.Flags().GetString("user")
+	p.Password, _ = cmd.Flags().GetString("password")
+
+	viper.Set("profiles."+name, p)
+	return viper.WriteConfigAs(cfgFile)
+}
+
+func listProfiles(cmd *cobra.Command, args []string) {
+	profiles := viper.GetStringMap("profiles")
+	for name := range profiles {
+		fmt.Println(name)
+	}
+}
+
+func useProfile(cmd *cobra.Command, args []string) error {
+	viper.Set("default", args[0])
+	return viper.WriteConfigAs(cfgFile)
+}
+
+func runRequest(cmd *cobra.Command, args []string) error {
+	method := strings.ToUpper(args[0])
+	endpoint := ""
+	if len(args) > 2 {
+		endpoint = args[1]
+	}
+
+	// Load profile
+	profile := viper.GetString("default")
+	flagProfile, _ := cmd.Flags().GetString("profile")
+	if flagProfile != "" {
+		profile = flagProfile
+	}
+
+	var prof Profile
+	if profile != "" {
+		if err := viper.UnmarshalKey("profiles."+profile, &prof); err != nil {
+			return fmt.Errorf("profile '%s' not found", profile)
 		}
 	}
+
+	// Prepare URL
+	if prof.BaseURL == "" {
+		return fmt.Errorf("baseURL is required in the profile or as an argument")
+	}
+
+	parsedBaseURL, err := url.Parse(prof.BaseURL)
+	if err != nil {
+		return fmt.Errorf("invalid baseURL: %v", err)
+	}
+
+	if endpoint != "" {
+		parsedPath, err := url.Parse(endpoint)
+		if err != nil {
+			return fmt.Errorf("invalid path: %v", err)
+		}
+		parsedBaseURL = parsedBaseURL.ResolveReference(parsedPath)
+	}
+
+	url := parsedBaseURL.String()
+
+	// Build payload
+	dataFlag, _ := cmd.Flags().GetString("data")
+	var bodyBytes []byte
+	switch {
+	case dataFlag == "-":
+		bodyBytes, err = io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("error reading from stdin: %w", err)
+		}
+	case strings.HasPrefix(dataFlag, "@"):
+		bodyBytes, err = os.ReadFile(strings.TrimPrefix(dataFlag, "@"))
+		if err != nil {
+			return fmt.Errorf("error reading file %s: %w", strings.TrimPrefix(dataFlag, "@"), err)
+		}
+	case dataFlag != "":
+		bodyBytes = []byte(dataFlag)
+	}
+
+	var body io.Reader
+	if len(bodyBytes) > 0 {
+		body = bytes.NewReader(bodyBytes)
+	}
+
+	// Setup client with mTLS
+	transport := &http.Transport{}
+	if prof.CA != "" {
+		caCert, err := os.ReadFile(prof.CA)
+		if err != nil {
+			return err
+		}
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM(caCert)
+		transport.TLSClientConfig = &tls.Config{RootCAs: pool}
+	}
+	if prof.Cert != "" && prof.Key != "" {
+		certPair, err := tls.LoadX509KeyPair(prof.Cert, prof.Key)
+		if err != nil {
+			return err
+		}
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		transport.TLSClientConfig.Certificates = []tls.Certificate{certPair}
+	}
+
+	httpClient := &http.Client{Transport: transport}
+
+	// Create request
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return err
+	}
+
+	// Auth shortcuts: flag overrides profile
+	tokenFlag, _ := cmd.Flags().GetString("token")
+	if tokenFlag != "" {
+		req.Header.Set("Authorization", "Bearer "+tokenFlag)
+	} else if prof.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+prof.Token)
+	}
+	userFlag, _ := cmd.Flags().GetString("user")
+	passFlag, _ := cmd.Flags().GetString("password")
+	if userFlag != "" && passFlag != "" {
+		req.SetBasicAuth(userFlag, passFlag)
+	} else if prof.Username != "" && prof.Password != "" {
+		req.SetBasicAuth(prof.Username, prof.Password)
+	}
+
+	// Headers: from profile then flags
+	for k, v := range prof.Headers {
+		req.Header.Set(k, v)
+	}
+	headersFlag, _ := cmd.Flags().GetStringArray("header")
+	for _, h := range headersFlag {
+		parts := strings.SplitN(h, ":", 2)
+		if len(parts) == 2 {
+			req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+		}
+	}
+
+	// Auto-detect JSON content type if not set by user and body exists
+	if len(bodyBytes) > 0 && req.Header.Get("Content-Type") == "" {
+		var js json.RawMessage
+		if json.Unmarshal(bodyBytes, &js) == nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+	}
+
+	// Execute
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Read response
+	respData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	// Pretty-print JSON if applicable
+	ct := resp.Header.Get("Content-Type")
+	if strings.Contains(ct, "application/json") {
+		var out bytes.Buffer
+		err = json.Indent(&out, respData, "", "  ")
+		if err != nil {
+			fmt.Println(string(respData))
+		} else {
+			fmt.Println(out.String())
+		}
+	} else {
+		os.Stdout.Write(respData)
+	}
+
+	// Save profile defaults if requested
+	if save, _ := cmd.Flags().GetBool("save"); save && profile != "" {
+		prof.Cert, _ = cmd.Flags().GetString("cert")
+		prof.Key, _ = cmd.Flags().GetString("key")
+		prof.CA, _ = cmd.Flags().GetString("ca")
+		prof.Token, _ = cmd.Flags().GetString("token")
+		prof.Username, _ = cmd.Flags().GetString("user")
+		prof.Password, _ = cmd.Flags().GetString("password")
+		combined := map[string]string{}
+		for k, v := range prof.Headers {
+			combined[k] = v
+		}
+		for _, h := range headersFlag {
+			parts := strings.SplitN(h, ":", 2)
+			if len(parts) == 2 {
+				combined[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			}
+		}
+	}
+
+	return nil
 }
